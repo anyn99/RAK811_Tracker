@@ -1,0 +1,473 @@
+/*
+ / _____)             _              | |
+( (____  _____ ____ _| |_ _____  ____| |__
+ \____ \| ___ |    (_   _) ___ |/ ___)  _ \
+ _____) ) ____| | | || |_| ____( (___| | | |
+(______/|_____)_|_|_| \__)_____)\____)_| |_|
+    (C)2016 Semtech
+
+Description: Board UART driver implementation
+
+License: Revised BSD License, see LICENSE.TXT file include in the project
+
+Maintainer: Miguel Luis and Gregory Cristian
+*/
+#include <board.h>
+#include <stdarg.h>
+#include "uart-board.h"
+#include <uart-board.h>
+
+//uint8_t RxData = 0;
+
+/*!
+ * FIFO buffers size
+ */
+#define FIFO_RX_SIZE                                512
+#define FIFO_TX_SIZE                                512
+
+uint8_t UART_RxBuffer[FIFO_RX_SIZE];
+uint8_t UART_TxBuffer[FIFO_TX_SIZE];
+uint8_t GPS_RxBuffer[FIFO_RX_SIZE];
+uint8_t GPS_TxBuffer[FIFO_TX_SIZE];
+
+typedef struct
+{
+  UART_HandleTypeDef UartHandle;
+  uint8_t RxData;
+  uint8_t TxData;
+} UartContext_t;
+
+UartContext_t UartContext[UART_COUNT];
+
+void UartMcuInit( Uart_t *obj, uint8_t uartId, PinNames tx, PinNames rx )
+{
+    obj->UartId = uartId;
+
+    if ( obj->UartId == UART_1 ) 
+    {
+      __HAL_RCC_USART1_FORCE_RESET( );
+      __HAL_RCC_USART1_RELEASE_RESET( );
+      __HAL_RCC_USART1_CLK_ENABLE( );
+      
+      GpioInit( &obj->Tx, tx, PIN_ALTERNATE_FCT, PIN_PUSH_PULL, PIN_PULL_UP, GPIO_AF7_USART1 );
+      GpioInit( &obj->Rx, rx, PIN_ALTERNATE_FCT, PIN_PUSH_PULL, PIN_PULL_UP, GPIO_AF7_USART1 );
+    }
+    else if( obj->UartId == UART_3 )
+    {
+      __HAL_RCC_USART3_FORCE_RESET( );
+      __HAL_RCC_USART3_RELEASE_RESET( );
+      __HAL_RCC_USART3_CLK_ENABLE( );
+      
+      GpioInit( &obj->Tx, tx, PIN_ALTERNATE_FCT, PIN_PUSH_PULL, PIN_PULL_UP, GPIO_AF7_USART3 );
+      GpioInit( &obj->Rx, rx, PIN_ALTERNATE_FCT, PIN_PUSH_PULL, PIN_PULL_UP, GPIO_AF7_USART3 );
+
+      BlockLowPowerDuringTask(true);
+    }
+}
+
+void UartMcuConfig( Uart_t *obj, UartMode_t mode, uint32_t baudrate, WordLength_t wordLength, StopBits_t stopBits, Parity_t parity, FlowCtrl_t flowCtrl )
+{
+    UART_HandleTypeDef * handle = &UartContext[obj->UartId].UartHandle;
+    IRQn_Type irq;
+         
+    //FifoInit( &obj->FifoTx, TxBuffer, FIFO_TX_SIZE );
+    
+    if( obj->UartId == UART_1 )
+    {
+      handle->Instance = USART1;
+      irq = USART1_IRQn;
+      FifoInit( &obj->FifoRx, UART_RxBuffer, FIFO_RX_SIZE );
+      FifoInit( &obj->FifoTx, UART_TxBuffer, FIFO_TX_SIZE );
+    }
+    else if( obj->UartId == UART_3 )
+    {
+      handle->Instance = USART3;
+      irq = USART3_IRQn;
+      FifoInit( &GpsUart.FifoRx, GPS_RxBuffer, FIFO_RX_SIZE );
+      FifoInit( &GpsUart.FifoTx, GPS_TxBuffer, FIFO_TX_SIZE );
+    }
+    else
+      return;
+
+    handle->Init.BaudRate = baudrate;
+    
+    if( mode == TX_ONLY )
+    {
+        if( obj->FifoTx.Data == NULL )
+        {
+            assert_param( FAIL );
+        }
+        handle->Init.Mode = UART_MODE_TX;
+    }
+    else if( mode == RX_ONLY )
+    {
+        if( obj->FifoRx.Data == NULL )
+        {
+            assert_param( FAIL );
+        }
+        handle->Init.Mode = UART_MODE_RX;
+    }
+    else if( mode == RX_TX )
+    {
+        if( ( obj->FifoTx.Data == NULL ) || ( obj->FifoRx.Data == NULL ) )
+        {
+            assert_param( FAIL );
+        }
+        handle->Init.Mode = UART_MODE_TX_RX;
+    }
+    else
+    {
+       assert_param( FAIL );
+    }
+
+    if( wordLength == UART_8_BIT )
+    {
+       handle->Init.WordLength = UART_WORDLENGTH_8B;
+    }
+    else if( wordLength == UART_9_BIT )
+    {
+        handle->Init.WordLength = UART_WORDLENGTH_9B;
+    }
+
+    switch( stopBits )
+    {
+    case UART_2_STOP_BIT:
+        handle->Init.StopBits = UART_STOPBITS_2;
+        break;
+    case UART_1_STOP_BIT:
+    default:
+        handle->Init.StopBits = UART_STOPBITS_1;
+        break;
+    }
+
+    if( parity == NO_PARITY )
+    {
+        handle->Init.Parity = UART_PARITY_NONE;
+    }
+    else if( parity == EVEN_PARITY )
+    {
+        handle->Init.Parity = UART_PARITY_EVEN;
+    }
+    else
+    {
+        handle->Init.Parity = UART_PARITY_ODD;
+    }
+
+    if( flowCtrl == NO_FLOW_CTRL )
+    {
+        handle->Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    }
+    else if( flowCtrl == RTS_FLOW_CTRL )
+    {
+        handle->Init.HwFlowCtl = UART_HWCONTROL_RTS;
+    }
+    else if( flowCtrl == CTS_FLOW_CTRL )
+    {
+        handle->Init.HwFlowCtl = UART_HWCONTROL_CTS;
+    }
+    else if( flowCtrl == RTS_CTS_FLOW_CTRL )
+    {
+        handle->Init.HwFlowCtl = UART_HWCONTROL_RTS_CTS;
+    }
+
+    handle->Init.OverSampling = UART_OVERSAMPLING_16;
+
+    if( HAL_UART_Init( handle ) != HAL_OK )
+    {
+        while( 1 );
+    }
+
+    HAL_NVIC_SetPriority( irq, 8, 0 );
+    HAL_NVIC_EnableIRQ( irq );
+
+    /* Enable the UART Data Register not empty Interrupt */
+    HAL_UART_Receive_IT( handle, &UartContext[obj->UartId].RxData, 1 );
+}
+
+void UartMcuDeInit( Uart_t *obj )
+{
+	if ( obj->UartId == UART_1 )
+	{
+		__HAL_RCC_USART1_FORCE_RESET( );
+		__HAL_RCC_USART1_RELEASE_RESET( );
+		__HAL_RCC_USART1_CLK_DISABLE( );
+
+		GpioInit( &obj->Tx, obj->Tx.pin, PIN_ANALOGIC, PIN_PUSH_PULL, PIN_NO_PULL, 0 );
+		GpioInit( &obj->Rx, obj->Rx.pin, PIN_ANALOGIC, PIN_PUSH_PULL, PIN_NO_PULL, 0 );
+	}
+	else if( obj->UartId == UART_3 )
+	{
+		__HAL_RCC_USART3_FORCE_RESET( );
+		__HAL_RCC_USART3_RELEASE_RESET( );
+		__HAL_RCC_USART3_CLK_DISABLE( );
+
+		GpioInit( &obj->Tx, obj->Tx.pin, PIN_ANALOGIC, PIN_PUSH_PULL, PIN_NO_PULL, 0 );
+		GpioInit( &obj->Rx, obj->Rx.pin, PIN_ANALOGIC, PIN_PUSH_PULL, PIN_NO_PULL, 0 );
+
+		BlockLowPowerDuringTask(false);
+	}
+}
+
+uint8_t UartMcuPutBuffer( Uart_t *obj, uint8_t *data, uint16_t size )
+{
+	//return HAL_UART_Transmit(&UartContext[obj->UartId].UartHandle, data, size, 0xFFFF);
+/*
+	assert_param(data);
+	assert_param(size);
+
+	UART_HandleTypeDef *handle = &UartContext[obj->UartId].UartHandle;
+	int i;
+	for (i = 0; i < size; i++)
+	{
+		if( IsFifoFull( &obj->FifoTx ) == true )
+		{
+			return 1; //Busy
+		}
+
+		BoardDisableIrq( );
+		FifoPush( &obj->FifoTx, data[i] );
+		BoardEnableIrq( );
+	}
+
+	uint8_t sdata;
+	if( IsFifoEmpty( &obj->FifoTx ) == false )
+    {
+		sdata = FifoPop( &obj->FifoTx );
+        //  Write one byte to the transmit data register
+        HAL_UART_Transmit_IT( handle, &sdata, 1 );
+    }
+    else
+    {
+        // Disable the USART Transmit interrupt
+        if (obj->UartId == UART_1) HAL_NVIC_DisableIRQ( USART1_IRQn );
+        if (obj->UartId == UART_3) HAL_NVIC_DisableIRQ( USART3_IRQn );
+    }
+	return 0;
+*/
+
+	int i;
+	for (i = 0; i < size; i++)
+	{
+		int TryCnt = 0;
+		while (UartMcuPutChar(obj, data[i]) != 0)
+		{
+			TryCnt++;
+			//DelayMs(1);
+			if (TryCnt > 15)
+				return 1;
+		}
+	}
+	return 0;
+}
+
+uint8_t UartMcuGetBuffer( Uart_t *obj, uint8_t *data, uint16_t size )
+{
+	return HAL_UART_Receive(&UartContext[obj->UartId].UartHandle, data, size, 0xFFFF);
+}
+
+uint8_t UartMcuPutChar( Uart_t *obj, uint8_t data )
+{
+	BoardDisableIrq( );
+	UartContext[obj->UartId].TxData = data;
+
+	if( IsFifoFull( &obj->FifoTx ) == false )
+	{
+		FifoPush( &obj->FifoTx, UartContext[obj->UartId].TxData );
+
+		// Trig UART Tx interrupt to start sending the FIFO contents.
+		__HAL_UART_ENABLE_IT( &UartContext[obj->UartId].UartHandle, UART_IT_TC );
+
+		BoardEnableIrq( );
+		return 0; // OK
+	}
+	BoardEnableIrq( );
+	return 1; // Busy
+}
+
+uint8_t UartMcuGetChar( Uart_t *obj, uint8_t *data )
+{
+	BoardDisableIrq( );
+	if( IsFifoEmpty( &obj->FifoRx ) == false )
+	{
+		*data = FifoPop( &obj->FifoRx );
+		BoardEnableIrq( );
+		return 0;
+	}
+	BoardEnableIrq( );
+	return 1;
+}
+
+void HAL_UART_TxCpltCallback( UART_HandleTypeDef *handle )
+{
+	Uart_t *uart = &Uart1;
+	UartId_t uartId = UART_1;
+
+	if( handle == &UartContext[UART_1].UartHandle )
+	{
+		uart = &Uart1;
+		uartId = UART_1;
+	}
+	else if( handle == &UartContext[UART_3].UartHandle )
+	{
+		uart = &GpsUart;
+		uartId = UART_3;
+	}
+	else // Unknown UART peripheral skip processing
+	return;
+
+    if( IsFifoEmpty( &uart->FifoTx ) == false )
+    {
+    	UartContext[uartId].TxData = FifoPop( &uart->FifoTx );
+    	        //  Write one byte to the transmit data register
+    	HAL_UART_Transmit_IT( handle, &UartContext[uartId].TxData, 1 );
+    }
+   else
+    {
+        // Disable the USART Transmit interrupt
+	   __HAL_UART_DISABLE_IT( handle, UART_IT_TC );
+    }
+
+    if( uart->IrqNotify != NULL )
+    {
+    	uart->IrqNotify( UART_NOTIFY_TX );
+    }
+
+    if (uartId == UART_3 && IsFifoFull( &uart->FifoRx ) == true && IsFifoEmpty( &uart->FifoTx ) == true)
+    {
+    	UartMcuDeInit(uart);
+    }
+}
+
+void HAL_UART_RxCpltCallback( UART_HandleTypeDef *handle )
+{
+	Uart_t *uart = &Uart1;
+	UartId_t uartId = UART_1;
+
+	if( handle == &UartContext[UART_1].UartHandle )
+	{
+		uart = &Uart1;
+		uartId = UART_1;
+	}
+	else if( handle == &UartContext[UART_3].UartHandle )
+	{
+		uart = &GpsUart;
+		uartId = UART_3;
+	}
+	else // Unknown UART peripheral skip processing
+		return;
+
+	if( IsFifoFull( &uart->FifoRx ) == false ) {
+		// Read one byte from the receive data register
+		FifoPush( &uart->FifoRx, UartContext[uartId].RxData );
+	}
+
+	if( uart->IrqNotify != NULL )
+		uart->IrqNotify( UART_NOTIFY_RX );
+
+	if (uartId == UART_3 && IsFifoFull( &uart->FifoRx ) == true && IsFifoEmpty( &uart->FifoTx ) == true)
+	{
+		UartMcuDeInit(uart);
+	}
+	else
+	{
+		HAL_UART_Receive_IT( &UartContext[uartId].UartHandle, &UartContext[uartId].RxData, 1 );
+	}
+}
+
+void HAL_UART_ErrorCallback( UART_HandleTypeDef *handle )
+{
+  UartId_t uartId = UART_1;
+  
+  if( handle == &UartContext[UART_1].UartHandle )
+    uartId = UART_1;
+  else if( handle == &UartContext[UART_3].UartHandle )
+    uartId = UART_3;
+  else // Unknown UART peripheral skip processing
+    return;
+  
+  HAL_UART_Receive_IT( &UartContext[uartId].UartHandle, &UartContext[uartId].RxData, 1 );
+}
+
+void USART1_IRQHandler( void )
+{
+	// [BEGIN] Workaround to solve an issue with the HAL drivers not managin the uart state correctly.
+	uint32_t tmpFlag = 0, tmpItSource = 0;
+
+	tmpFlag = __HAL_UART_GET_FLAG( &UartContext[UART_1].UartHandle, UART_FLAG_TC );
+	tmpItSource = __HAL_UART_GET_IT_SOURCE( &UartContext[UART_1].UartHandle, UART_IT_TC );
+	// UART in mode Transmitter end
+	if( ( tmpFlag != RESET ) && ( tmpItSource != RESET ) )
+	{
+		if( ( UartContext[UART_1].UartHandle.State == HAL_UART_STATE_BUSY_RX ) || UartContext[UART_1].UartHandle.State == HAL_UART_STATE_BUSY_TX_RX )
+		{
+			UartContext[UART_1].UartHandle.State = HAL_UART_STATE_BUSY_TX_RX;
+		}
+	}
+	// [END] Workaround to solve an issue with the HAL drivers not managin the uart state correctly.
+
+	HAL_UART_IRQHandler( &UartContext[UART_1].UartHandle );
+}
+
+void USART3_IRQHandler( void )
+{
+  // [BEGIN] Workaround to solve an issue with the HAL drivers not managin the uart state correctly.
+  uint32_t tmpFlag = 0, tmpItSource = 0;
+  
+  tmpFlag = __HAL_UART_GET_FLAG( &UartContext[UART_3].UartHandle, UART_FLAG_TC );
+  tmpItSource = __HAL_UART_GET_IT_SOURCE( &UartContext[UART_3].UartHandle, UART_IT_TC );
+  // UART in mode Transmitter end
+  if( ( tmpFlag != RESET ) && ( tmpItSource != RESET ) )
+  {
+    if( ( UartContext[UART_3].UartHandle.State == HAL_UART_STATE_BUSY_RX ) || UartContext[UART_3].UartHandle.State == HAL_UART_STATE_BUSY_TX_RX )
+    {
+      UartContext[UART_3].UartHandle.State = HAL_UART_STATE_BUSY_TX_RX;
+    }
+  }
+  // [END] Workaround to solve an issue with the HAL drivers not managin the uart state correctly.
+  
+  HAL_UART_IRQHandler( &UartContext[UART_3].UartHandle );
+}
+
+
+#if   defined ( __CC_ARM )
+  #ifdef __GNUC__
+    /* With GCC/RAISONANCE, small printf (option LD Linker->Libraries->Small printf
+       set to 'Yes') calls __io_putchar() */
+    #define PUTCHAR_PROTOTYPE int __io_putchar(int ch)
+  #else
+    #define PUTCHAR_PROTOTYPE int fputc(int ch, FILE *f)
+  #endif /* __GNUC__ */
+  /**
+    * @brief  Retargets the C library printf function to the USART.
+    * @param  None
+    * @retval None
+    */
+  PUTCHAR_PROTOTYPE
+  {
+    /* Place your implementation of fputc here */
+    /* e.g. write a character to the EVAL_COM1 and Loop until the end of transmission */
+    HAL_UART_Transmit(&UartContext[UART_1].UartHandle, (uint8_t *)&ch, 1, 0xFFFF);		
+    /* Loop until the end of transmission */
+    return ch;
+  }
+#endif	
+	
+int e_getchar(void)
+{
+    int c = -1;
+    uint8_t data;
+
+    if (UartMcuGetChar(&Uart1, &data) == 0) {
+        c = data;
+    } 
+    return c;
+}
+
+int e_printchar(char ch)
+{
+	HAL_UART_Transmit(&UartContext[UART_1].UartHandle, (uint8_t *)&ch, 1, 0xFFFF);
+	//UartMcuPutChar(&Uart1, ch);
+	return ch;
+}
+
+
